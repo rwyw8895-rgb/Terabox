@@ -5,8 +5,11 @@ import { pipeline } from "stream/promises";
 import { Readable } from "stream";
 import {
   isTeraboxUrl,
+  isDiskwalaUrl,
+  extractDiskwalaId,
   extractUrlFromText,
   resolveTeraboxLink,
+  resolveDiskwalaLink,
   cleanFilename,
   formatBytes,
   detectExtensionFromBuffer,
@@ -245,8 +248,9 @@ function queueRetryJob(url: string, chatId?: number | string, fileNames: string[
 
 async function resolveQueuedFileNames(task: DownloadQueueTask) {
   try {
+    const resolver = isDiskwalaUrl(task.url) ? resolveDiskwalaLink : resolveTeraboxLink;
     const metadata = await withRetries(
-      () => resolveTeraboxLink(task.url),
+      () => resolver(task.url),
       "Queued link inspection"
     );
     task.fileNames = metadata.files.map((file) => cleanFilename(file.filename));
@@ -470,7 +474,7 @@ async function pollTelegramUpdates() {
         continue;
       }
 
-      if (isTeraboxUrl(text)) {
+      if (isTeraboxUrl(text) || isDiskwalaUrl(text)) {
         const url = extractUrlFromText(text) || text;
         enqueueDownloadJob(url, chatId).catch((err) => {
           console.error("Job execution error from telegram message:", err);
@@ -478,7 +482,7 @@ async function pollTelegramUpdates() {
       } else {
         await telegramService.sendMessage(
           chatId,
-          `⚠️ Please send a valid TeraBox share link.`
+          `⚠️ Please send a valid TeraBox or Diskwala share link.`
         );
       }
     }
@@ -604,10 +608,10 @@ async function processDownloadJob(
   };
 
   try {
-    await updateStatus("resolving", 25, "Checking your TeraBox link...");
+    await updateStatus("resolving", 25, isDiskwalaUrl(url) ? "Checking your Diskwala link..." : "Checking your TeraBox link...");
     const metadata = await withRetries(
-      () => resolveTeraboxLink(url),
-      "TeraBox link resolution"
+      () => (isDiskwalaUrl(url) ? resolveDiskwalaLink(url) : resolveTeraboxLink(url)),
+      isDiskwalaUrl(url) ? "Diskwala link resolution" : "TeraBox link resolution"
     );
 
     const processedFiles: ProcessedFile[] = [];
@@ -1091,11 +1095,11 @@ app.post("/api/terabox/resolve", async (req, res) => {
   if (!url) {
     return res.status(400).json({ error: "URL is required" });
   }
-  if (!isTeraboxUrl(url)) {
-    return res.status(400).json({ error: "URL does not match supported TeraBox domains" });
+  if (!isTeraboxUrl(url) && !isDiskwalaUrl(url)) {
+    return res.status(400).json({ error: "URL does not match supported TeraBox or Diskwala domains" });
   }
   try {
-    const meta = await resolveTeraboxLink(url);
+    const meta = isDiskwalaUrl(url) ? await resolveDiskwalaLink(url) : await resolveTeraboxLink(url);
     res.json(meta);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1107,8 +1111,8 @@ app.post("/api/jobs", async (req, res) => {
   if (!url) {
     return res.status(400).json({ error: "URL is required" });
   }
-  if (!isTeraboxUrl(url)) {
-    return res.status(400).json({ error: "Invalid TeraBox URL format" });
+  if (!isTeraboxUrl(url) && !isDiskwalaUrl(url)) {
+    return res.status(400).json({ error: "Invalid TeraBox or Diskwala URL format" });
   }
 
   if (req.headers.host) {
@@ -1150,7 +1154,7 @@ app.get("/api/downloads/:jobId/:fileIndex", (req, res) => {
 
     if (job && job.files && job.files[idx]) {
       const file = job.files[idx];
-      filePath = file.path;
+      filePath = file.path ?? null;
       filename = file.filename;
     } else {
       // Fallback: check download folder directly
@@ -1197,7 +1201,7 @@ app.get("/api/health", (req, res) => {
 app.post("/api/telegram/webhook", async (req, res) => {
   // Webhook handler support
   const update = req.body;
-  if (update?.message?.text && isTeraboxUrl(update.message.text)) {
+  if (update?.message?.text && (isTeraboxUrl(update.message.text) || isDiskwalaUrl(update.message.text))) {
     const chatId = update.message.chat.id;
     const url = extractUrlFromText(update.message.text) || update.message.text;
     enqueueDownloadJob(url, chatId).catch(console.error);

@@ -24,6 +24,9 @@ export const VIDEO_EXTENSIONS = new Set([
 export const TERABOX_DOMAINS_PATTERN =
   /(?:terabox|terashare|terafileshare|1024tera|1024-tera|tera-box|nephobox|mirrobox|mirrorbox|momerybox|tibibox|gibibox|pebibox|4funbox|dubox|bestclouddrive)/i;
 
+export const DISKWALA_DOMAINS_PATTERN =
+  /(?:diskwala|thediskwala|diskwala\.fun|dw\.link|diskflow\.me)/i;
+
 export function isTeraboxUrl(text: string): boolean {
   if (!text) return false;
   if (TERABOX_DOMAINS_PATTERN.test(text)) return true;
@@ -35,6 +38,45 @@ export function isTeraboxUrl(text: string): boolean {
     return true;
   }
   return false;
+}
+
+export function isDiskwalaUrl(text: string): boolean {
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (DISKWALA_DOMAINS_PATTERN.test(trimmed)) return true;
+  if (/^[a-fA-F0-9]{20,32}$/.test(trimmed)) return true;
+  if (/https?:\/\/.*/i.test(trimmed) && /(?:diskwala|dw\.link|diskflow)/i.test(trimmed)) return true;
+  return false;
+}
+
+export function extractDiskwalaId(rawUrl: string): string | null {
+  const trimmed = rawUrl.trim();
+  if (/^[a-fA-F0-9]{20,32}$/.test(trimmed)) return trimmed;
+
+  const patterns = [
+    /https?:\/\/(?:www\.)?diskwala\.com\/(?:app|file)\/([a-zA-Z0-9_\-]+)/i,
+    /https?:\/\/(?:www\.)?diskwala\.com\/([a-zA-Z0-9_\-]+)/i,
+    /https?:\/\/(?:www\.)?thediskwala\.com\/(?:app|file)?\/([a-zA-Z0-9_\-]+)/i,
+    /https?:\/\/(?:www\.)?diskwala\.fun\/(?:diskwala\/)?([a-zA-Z0-9_\-]+)/i,
+    /https?:\/\/(?:www\.)?dw\.link\/([a-zA-Z0-9_\-]+)/i,
+    /https?:\/\/(?:www\.)?diskflow\.me\/([a-zA-Z0-9_\-]+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = trimmed.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+
+  try {
+    const urlObj = new URL(trimmed);
+    const pathParts = urlObj.pathname.split("/").filter(Boolean);
+    const lastPart = pathParts[pathParts.length - 1];
+    if (lastPart && lastPart.length >= 8 && !/[?#]/.test(lastPart)) return lastPart;
+  } catch {
+    // ignore invalid URLs
+  }
+
+  return null;
 }
 
 export function extractUrlFromText(text: string): string | null {
@@ -202,6 +244,150 @@ export interface ResolvedMetadata {
   directDownloadPossible: boolean;
   cookies?: string;
   refererUrl?: string;
+}
+
+async function resolveDiskwalaViaPublicPage(normalizedUrl: string, id: string): Promise<ResolvedMetadata | null> {
+  const candidateUrls = [
+    normalizedUrl,
+    `https://www.diskwala.com/file/${id}`,
+    `https://www.diskwala.com/app/${id}`,
+  ];
+
+  for (const pageUrl of candidateUrls) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      const pageRes = await fetch(pageUrl, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        redirect: "follow",
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!pageRes.ok) continue;
+
+      const html = await pageRes.text();
+      const titleMatch =
+        html.match(/<meta property="og:title" content="([^"]+)"/i) ||
+        html.match(/<meta name="title" content="([^"]+)"/i) ||
+        html.match(/<title>([^<]+)<\/title>/i);
+      const descriptionMatch = html.match(/<meta property="og:description" content="([^"]+)"/i);
+      const directDownloadMatch = html.match(/https?:\/\/[^\s"'<>]+\.(?:mp4|mkv|webm|avi|mov|zip|rar|pdf|mp3|m4a|jpg|jpeg|png)[^\s"'<>]*/i);
+      const rawTitle = titleMatch ? titleMatch[1].trim() : descriptionMatch ? descriptionMatch[1].trim() : `Diskwala_File_${id}`;
+      const fileTitle = rawTitle.replace(/\s*[-|–]\s*DiskWala.*$/i, "").trim() || `Diskwala_File_${id}`;
+      const fileName = cleanFilename(fileTitle || `${id}.bin`);
+      const downloadUrl = directDownloadMatch ? directDownloadMatch[0].replace(/[),.;]+$/, "") : pageUrl;
+
+      return {
+        title: fileName,
+        files: [{
+          filename: fileName,
+          sizeBytes: 0,
+          sizeFormatted: "Unknown size",
+          isVideo: /\.(mp4|mkv|webm|avi|mov|m4v|ts|flv)$/i.test(fileName),
+          isZip: /\.(zip|rar|7z|tar|gz)$/i.test(fileName),
+          downloadUrl,
+        }],
+        directDownloadPossible: Boolean(downloadUrl),
+        cookies: undefined,
+        refererUrl: pageUrl,
+      };
+    } catch (err) {
+      console.warn("Diskwala public page fallback failed:", err);
+    }
+  }
+
+  return null;
+}
+
+export async function resolveDiskwalaLink(rawUrl: string): Promise<ResolvedMetadata> {
+  const cleanUrl = rawUrl.trim();
+  const id = extractDiskwalaId(cleanUrl);
+
+  if (!id) {
+    throw new Error("Invalid Diskwala URL format. Supported examples: diskwala.com/app/<id>, dw.link/<id>");
+  }
+
+  const normalizedUrl = `https://www.diskwala.com/app/${id}`;
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    Accept: "application/json,text/html,application/xhtml+xml,*/*",
+    Origin: "https://diskwala.fun",
+    Referer: "https://diskwala.fun/",
+  };
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const apiRes = await fetch("https://diskwala.fun/api/resolve", {
+      method: "POST",
+      headers: {
+        ...headers,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ url: normalizedUrl }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (apiRes.ok) {
+      const data = await apiRes.json() as any;
+      if (data?.ok && data?.result) {
+        const result = data.result;
+        const fileName = cleanFilename(result.fileName || result.title || `${id}.bin`);
+        const size = Number(result.fileSizeBytes || 0);
+        const downloadUrl = result.downloadUrl || result.streamUrl || result.watchUrl || normalizedUrl;
+        const streamUrl = result.streamUrl || result.watchUrl || result.downloadUrl;
+
+        return {
+          title: result.title || fileName,
+          files: [{
+            filename: fileName,
+            sizeBytes: size,
+            sizeFormatted: formatBytes(size),
+            isVideo: /\.(mp4|mkv|webm|avi|mov|flv|m4v|3gp|ts)$/i.test(fileName),
+            isZip: /\.(zip|rar|7z|tar|gz)$/i.test(fileName),
+            downloadUrl,
+            streamUrl,
+          }],
+          directDownloadPossible: Boolean(downloadUrl || streamUrl),
+          cookies: undefined,
+          refererUrl: "https://diskwala.fun/",
+        };
+      }
+
+      if (data?.error === "quota_exceeded") {
+        console.warn("Diskwala shared resolver quota reached, trying public web fallback:", data.message);
+      }
+    }
+  } catch (err) {
+    console.warn("Diskwala API resolve failed:", err);
+  }
+
+  const publicPageFallback = await resolveDiskwalaViaPublicPage(normalizedUrl, id);
+  if (publicPageFallback) {
+    return publicPageFallback;
+  }
+
+  return {
+    title: `Diskwala_File_${id}`,
+    files: [{
+      filename: `Diskwala_File_${id}`,
+      sizeBytes: 0,
+      sizeFormatted: "Unknown size",
+      isVideo: false,
+      isZip: false,
+      downloadUrl: normalizedUrl,
+    }],
+    directDownloadPossible: true,
+    cookies: undefined,
+    refererUrl: normalizedUrl,
+  };
 }
 
 export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetadata> {
