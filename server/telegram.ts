@@ -30,6 +30,19 @@ export interface TelegramUpdate {
     date: number;
     text?: string;
   };
+  callback_query?: {
+    id: string;
+    data?: string;
+    from: {
+      id: number;
+    };
+    message?: {
+      message_id: number;
+      chat: {
+        id: number;
+      };
+    };
+  };
 }
 
 export interface TelegramBotCommand {
@@ -71,7 +84,8 @@ export class TelegramService {
   async sendMessage(
     chatId: number | string,
     text: string,
-    parseMode: "Markdown" | "HTML" = "Markdown"
+    parseMode: "Markdown" | "HTML" = "Markdown",
+    replyMarkup?: object
   ): Promise<{ message_id: number }> {
     const res = await fetch(`${this.apiBaseUrl}/sendMessage`, {
       method: "POST",
@@ -80,6 +94,7 @@ export class TelegramService {
         chat_id: chatId,
         text,
         parse_mode: parseMode,
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       }),
     });
     const data = (await res.json()) as any;
@@ -91,6 +106,7 @@ export class TelegramService {
         body: JSON.stringify({
           chat_id: chatId,
           text,
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
         }),
       });
       const fbData = (await fallback.json()) as any;
@@ -102,11 +118,32 @@ export class TelegramService {
     return data.result;
   }
 
+  async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.apiBaseUrl}/answerCallbackQuery`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          callback_query_id: callbackQueryId,
+          ...(text ? { text } : {}),
+        }),
+      });
+      const data = (await res.json()) as any;
+      if (!data.ok) {
+        console.warn(`Telegram deleteMessage failed: ${data.description || "unknown error"}`);
+      }
+      return !!data.ok;
+    } catch {
+      return false;
+    }
+  }
+
   async editMessageText(
     chatId: number | string,
     messageId: number,
     text: string,
-    parseMode: "Markdown" | "HTML" = "Markdown"
+    parseMode: "Markdown" | "HTML" = "Markdown",
+    replyMarkup?: object
   ): Promise<boolean> {
     try {
       const res = await fetch(`${this.apiBaseUrl}/editMessageText`, {
@@ -117,6 +154,7 @@ export class TelegramService {
           message_id: messageId,
           text,
           parse_mode: parseMode,
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
         }),
       });
       const data = (await res.json()) as any;
@@ -129,6 +167,7 @@ export class TelegramService {
             chat_id: chatId,
             message_id: messageId,
             text,
+            ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
           }),
         });
       }

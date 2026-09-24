@@ -25,6 +25,8 @@ import {
 import { TelegramService, TelegramBotInfo } from "./server/telegram.ts";
 import { MTProtoService } from "./server/mtproto.ts";
 import type { DownloadJob, ProcessedFile, BotStatus } from "./src/types.ts";
+import { formatLinkCounter, getLinkCounterForUrl, normalizeLink } from "./src/linkCounter.ts";
+import { classifyQueueTier, shouldPauseLargeJobForSmallerQueue } from "./src/queuePriority.ts";
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE) || 100;
@@ -86,6 +88,7 @@ app.use((req, res, next) => {
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
 const DOWNLOADS_DIR = path.join(DATA_DIR, "downloads");
 const UNPACKED_DIR = path.join(DATA_DIR, "unpacked");
+const POLLING_OFFSET_FILE = path.join(DATA_DIR, "telegram-offset.json");
 fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 fs.mkdirSync(UNPACKED_DIR, { recursive: true });
 
@@ -153,13 +156,30 @@ function initMTProto() {
 initMTProto();
 let botInfo: TelegramBotInfo | null = null;
 let isPolling = false;
-let pollingOffset = 0;
 let pollingTimeoutId: NodeJS.Timeout | null = null;
+
+function loadPollingOffset(): number {
+  try {
+    const saved = JSON.parse(fs.readFileSync(POLLING_OFFSET_FILE, "utf-8"));
+    return Number.isInteger(saved.offset) && saved.offset >= 0 ? saved.offset : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function savePollingOffset(offset: number): void {
+  try {
+    fs.writeFileSync(POLLING_OFFSET_FILE, JSON.stringify({ offset }), "utf-8");
+  } catch (err) {
+    console.warn("Could not save Telegram polling offset:", err);
+  }
+}
+
+let pollingOffset = loadPollingOffset();
 
 const botCommands = [
   { command: "start", description: "Start the bot" },
   { command: "queue", description: "View the current download queue" },
-  { command: "retries", description: "View the retry queue" },
   { command: "space", description: "Check server storage" },
   { command: "status", description: "Check bot status" },
   { command: "help", description: "Show help" },
@@ -195,7 +215,11 @@ type DownloadQueueTask = {
   url: string;
   chatId?: number | string;
   fileNames: string[] | null;
+  sizeBytes?: number;
+  sizeIsEstimated?: boolean;
+  cancelRequested?: boolean;
   retryCount?: number;
+  isLarge?: boolean;
   resolve: (job: DownloadJob) => void;
   reject: (error: unknown) => void;
 };
@@ -208,9 +232,85 @@ type RetryQueueItem = {
   maxRetries: number;
 };
 
-const downloadQueue: DownloadQueueTask[] = [];
+const LARGE_FILE_SIZE_THRESHOLD_BYTES = 200 * 1024 * 1024;
+const q1DownloadQueue: DownloadQueueTask[] = [];
+const q2DownloadQueue: DownloadQueueTask[] = [];
+const q3DownloadQueue: DownloadQueueTask[] = [];
+const q4DownloadQueue: DownloadQueueTask[] = [];
 const retryQueue: RetryQueueItem[] = [];
 let isDownloadInProgress = false;
+let activeQueueTier: "q1" | "q2" | "q3" | "q4" | null = null;
+let activeTask: DownloadQueueTask | null = null;
+const activeCancellationTasks = new Map<string, DownloadQueueTask>();
+let pausedActiveJob: {
+  task: DownloadQueueTask;
+  tier: "q1" | "q2" | "q3" | "q4";
+  resume: () => void;
+} | null = null;
+
+function getQueueCounts(): { q1: number; q2: number; q3: number; q4: number } {
+  return {
+    q1: q1DownloadQueue.length,
+    q2: q2DownloadQueue.length,
+    q3: q3DownloadQueue.length,
+    q4: q4DownloadQueue.length,
+  };
+}
+
+function getDownloadQueueLength(): number {
+  return q1DownloadQueue.length + q2DownloadQueue.length + q3DownloadQueue.length + q4DownloadQueue.length;
+}
+
+function compareQueueTasks(left: DownloadQueueTask, right: DownloadQueueTask): number {
+  return (left.sizeBytes ?? Number.MAX_SAFE_INTEGER) - (right.sizeBytes ?? Number.MAX_SAFE_INTEGER);
+}
+
+function getNextQueuedTask(): DownloadQueueTask | undefined {
+  const queues = [q1DownloadQueue, q2DownloadQueue, q3DownloadQueue, q4DownloadQueue];
+  for (const queue of queues) {
+    queue.sort(compareQueueTasks);
+    if (queue.length > 0) return queue.shift();
+  }
+  return undefined;
+}
+
+function pushTaskToCorrectQueue(task: DownloadQueueTask): void {
+  const queueTier = classifyQueueTier(task.sizeBytes ?? 0);
+  const queueMap = {
+    q1: q1DownloadQueue,
+    q2: q2DownloadQueue,
+    q3: q3DownloadQueue,
+    q4: q4DownloadQueue,
+  };
+  queueMap[queueTier].push(task);
+}
+
+function shouldPauseActiveLargeJob(): boolean {
+  if (!activeQueueTier || activeQueueTier === 'q1' || activeQueueTier === 'q2' || activeQueueTier === 'q3') {
+    return false;
+  }
+  return shouldPauseLargeJobForSmallerQueue(activeQueueTier, getQueueCounts());
+}
+
+function hasHigherPriorityQueuedTask(): boolean {
+  return q1DownloadQueue.length > 0 || q2DownloadQueue.length > 0 || q3DownloadQueue.length > 0;
+}
+
+async function yieldActiveLargeJob(task: DownloadQueueTask): Promise<void> {
+  if (task.cancelRequested) {
+    throw new Error("Download cancelled by user");
+  }
+  if (activeTask !== task || !shouldPauseActiveLargeJob() || !activeQueueTier) return;
+
+  const tier = activeQueueTier;
+  await new Promise<void>((resume) => {
+    pausedActiveJob = { task, tier, resume };
+    activeTask = null;
+    activeQueueTier = null;
+    isDownloadInProgress = false;
+    processDownloadQueue();
+  });
+}
 
 function getRetryDisplayName(fileNames: string[] | null, url: string): string {
   const firstName = fileNames?.find((name) => !!name?.trim());
@@ -246,6 +346,16 @@ function queueRetryJob(url: string, chatId?: number | string, fileNames: string[
   retryQueue.push(item);
 }
 
+function getKnownDownloadedSize(url: string): number | undefined {
+  const normalizedUrl = normalizeLink(url);
+  const previousJob = jobs.find((job) => {
+    return job.status === "completed" && normalizeLink(job.url) === normalizedUrl && job.files.length > 0;
+  });
+  if (!previousJob) return undefined;
+
+  return previousJob.files.reduce((total, file) => total + file.sizeBytes, 0);
+}
+
 async function resolveQueuedFileNames(task: DownloadQueueTask) {
   try {
     const resolver = isDiskwalaUrl(task.url) ? resolveDiskwalaLink : resolveTeraboxLink;
@@ -254,32 +364,61 @@ async function resolveQueuedFileNames(task: DownloadQueueTask) {
       "Queued link inspection"
     );
     task.fileNames = metadata.files.map((file) => cleanFilename(file.filename));
+    const totalEstimatedBytes = metadata.files.reduce((sum, file) => sum + (file.sizeBytes || 0), 0);
+    const knownDownloadedSize = getKnownDownloadedSize(task.url);
+    task.sizeBytes = knownDownloadedSize ?? totalEstimatedBytes;
+    task.sizeIsEstimated = knownDownloadedSize === undefined;
+    task.isLarge =
+      task.sizeBytes >= LARGE_FILE_SIZE_THRESHOLD_BYTES ||
+      metadata.files.some((file) => (file.sizeBytes || 0) >= LARGE_FILE_SIZE_THRESHOLD_BYTES);
+
+    const tier = classifyQueueTier(task.sizeBytes || 0);
+    const queueMap = { q1: q1DownloadQueue, q2: q2DownloadQueue, q3: q3DownloadQueue, q4: q4DownloadQueue };
+    const currentQueue = queueMap[tier];
+    if (!currentQueue.includes(task)) currentQueue.push(task);
   } catch {
     task.fileNames = [];
+    task.sizeBytes = 0;
+    task.sizeIsEstimated = false;
+    task.isLarge = false;
+    if (!q1DownloadQueue.includes(task)) q1DownloadQueue.push(task);
   }
 }
 
 function processDownloadQueue() {
   if (isDownloadInProgress) return;
 
-  if (downloadQueue.length === 0 && retryQueue.length > 0) {
+  if (pausedActiveJob && !hasHigherPriorityQueuedTask()) {
+    const paused = pausedActiveJob;
+    pausedActiveJob = null;
+    activeTask = paused.task;
+    activeQueueTier = paused.tier;
+    isDownloadInProgress = true;
+    paused.resume();
+    return;
+  }
+
+  if (getDownloadQueueLength() === 0 && retryQueue.length > 0) {
     const retryItem = retryQueue.shift()!;
-    downloadQueue.push({
+    pushTaskToCorrectQueue({
       url: retryItem.url,
       chatId: retryItem.chatId,
       fileNames: retryItem.fileNames,
       retryCount: retryItem.retryCount,
+      isLarge: false,
       resolve: () => undefined,
       reject: () => undefined,
     });
   }
 
-  if (downloadQueue.length === 0) return;
+  const task = getNextQueuedTask();
+  if (!task) return;
 
-  const task = downloadQueue.shift()!;
+  activeQueueTier = classifyQueueTier(task.sizeBytes ?? 0);
+  activeTask = task;
   isDownloadInProgress = true;
 
-  processDownloadJob(task.url, task.chatId, task.retryCount ?? 0)
+  processDownloadJob(task, task.url, task.chatId, task.retryCount ?? 0)
     .then((job) => {
       if (task.resolve) task.resolve(job);
     })
@@ -287,27 +426,18 @@ function processDownloadQueue() {
       if (task.reject) task.reject(error);
     })
     .finally(() => {
-      isDownloadInProgress = false;
-      processDownloadQueue();
+      if (activeTask === task) {
+        activeTask = null;
+        activeQueueTier = null;
+        isDownloadInProgress = false;
+        processDownloadQueue();
+      }
     });
 }
 
 function enqueueDownloadJob(url: string, chatId?: number | string): Promise<DownloadJob> {
-  if (downloadQueue.length >= MAX_QUEUE_SIZE) {
+  if (getDownloadQueueLength() >= MAX_QUEUE_SIZE) {
     return Promise.reject(new Error("The download queue is full. Please try again in a few minutes."));
-  }
-
-  const waitingCount = downloadQueue.length + (isDownloadInProgress ? 1 : 0);
-
-  if (waitingCount > 0 && chatId && telegramService) {
-    telegramService
-      .sendMessage(
-        chatId,
-        `⏳ Your request is in line. There ${waitingCount === 1 ? "is" : "are"} ${waitingCount} job${waitingCount === 1 ? "" : "s"} ahead of it.`
-      )
-      .catch(() => {
-        // Ignore queue notification failures.
-      });
   }
 
   return new Promise<DownloadJob>((resolve, reject) => {
@@ -315,14 +445,17 @@ function enqueueDownloadJob(url: string, chatId?: number | string): Promise<Down
       url,
       chatId,
       fileNames: null,
+      isLarge: false,
       resolve,
       reject,
     };
-    downloadQueue.push(task);
-    resolveQueuedFileNames(task).catch(() => {
-      task.fileNames = [];
-    });
-    processDownloadQueue();
+    resolveQueuedFileNames(task)
+      .then(() => {
+        processDownloadQueue();
+      })
+      .catch((error) => {
+        reject(error);
+      });
   });
 }
 
@@ -343,6 +476,21 @@ async function updateBotInfo() {
   }
 }
 
+async function discardPendingTelegramUpdates(): Promise<void> {
+  if (!telegramService || pollingOffset > 0) return;
+
+  try {
+    const pendingUpdates = await telegramService.getUpdates(-1, 0);
+    const latestUpdate = pendingUpdates.at(-1);
+    if (latestUpdate) {
+      pollingOffset = latestUpdate.update_id + 1;
+      savePollingOffset(pollingOffset);
+    }
+  } catch (err) {
+    console.warn("Could not discard old Telegram updates:", err);
+  }
+}
+
 // Background Telegram polling loop
 async function pollTelegramUpdates() {
   if (!isPolling || !telegramService) return;
@@ -351,13 +499,36 @@ async function pollTelegramUpdates() {
     const updates = await telegramService.getUpdates(pollingOffset, 5);
     for (const update of updates) {
       pollingOffset = update.update_id + 1;
+      savePollingOffset(pollingOffset);
+      const callbackQuery = update.callback_query;
+      if (callbackQuery) {
+        await telegramService.answerCallbackQuery(callbackQuery.id, "Cancellation requested");
+        const [action, jobId] = (callbackQuery.data || "").split(":", 2);
+        if (action === "cancel" && jobId) {
+          const task = activeCancellationTasks.get(jobId);
+          const callbackChatId = callbackQuery.message?.chat.id;
+          if (task) {
+            task.cancelRequested = true;
+            if (callbackChatId) {
+              await telegramService.sendMessage(
+                callbackChatId,
+                "🛑 Cancellation requested. The download will stop at the next safe checkpoint."
+              );
+            }
+          } else if (callbackChatId) {
+            await telegramService.sendMessage(callbackChatId, "ℹ️ This download has already finished.");
+          }
+        }
+        continue;
+      }
       const msg = update.message;
       if (!msg || !msg.text) continue;
 
       const chatId = msg.chat.id;
       const text = msg.text.trim();
+      const command = text.split(/\s+/, 1)[0].split("@", 1)[0].toLowerCase();
 
-      if (text === "/start") {
+      if (command === "/start") {
         await telegramService.sendMessage(
           chatId,
           `👋 *TeraBox Downloader Bot Active*\n\n` +
@@ -371,7 +542,7 @@ async function pollTelegramUpdates() {
         continue;
       }
 
-      if (text === "/help") {
+      if (command === "/help") {
         await telegramService.sendMessage(
           chatId,
           `📖 *Help & Instructions*\n\n` +
@@ -380,13 +551,12 @@ async function pollTelegramUpdates() {
             `3. ZIP files are unpacked automatically.\n` +
             `4. Large files are sent in full when possible, or split into smaller parts.\n\n` +
             `📋 /queue - See the current and waiting downloads.\n` +
-            `🔁 /retries - See how many links are waiting to be retried.\n` +
             `⚡ /status - See bot health and queue counts.`
         );
         continue;
       }
 
-      if (text === "/status") {
+      if (command === "/status") {
         const activeCount = jobs.filter(
           (j) => j.status !== "completed" && j.status !== "failed"
         ).length;
@@ -394,59 +564,71 @@ async function pollTelegramUpdates() {
           chatId,
           `⚡ *Bot Status:* Online\n` +
             `📥 *Active Jobs:* ${activeCount}\n` +
-            `⏳ *Waiting in Queue:* ${downloadQueue.length}\n` +
-            `� *Retry Queue:* ${retryQueue.length}\n` +
-            `�📁 *Total Processed:* ${jobs.length}`
+            `📦 *Q1:* ${q1DownloadQueue.length}\n` +
+            `🟦 *Q2:* ${q2DownloadQueue.length}\n` +
+            `🟧 *Q3:* ${q3DownloadQueue.length}\n` +
+            `🧱 *Q4:* ${q4DownloadQueue.length}\n` +
+            `🔁 *Retry Queue:* ${retryQueue.length}\n` +
+            `📁 *Total Processed:* ${jobs.length}`
         );
         continue;
       }
 
-      if (text === "/queue") {
+      if (command === "/queue") {
         const activeJob = jobs.find(
           (j) => j.status !== "completed" && j.status !== "failed"
         );
-        const queueLines = downloadQueue.map(
-          (task, index) =>
-            `${index + 1}. ${task.fileNames === null
-              ? "Checking file names..."
-              : task.fileNames.length > 0
-                ? task.fileNames.join(", ")
-                : "File names unavailable"}`
-        );
-        const activeLine = activeJob
-          ? `🔄 *Now processing:* ${activeJob.files.length > 0
-            ? activeJob.files.map((file) => file.filename).join(", ")
-            : "Checking file names..."}\n`
+        const queueGroups = [
+          { label: "Q1", values: [...q1DownloadQueue].sort(compareQueueTasks) },
+          { label: "Q2", values: [...q2DownloadQueue].sort(compareQueueTasks) },
+          { label: "Q3", values: [...q3DownloadQueue].sort(compareQueueTasks) },
+          { label: "Q4", values: [...q4DownloadQueue].sort(compareQueueTasks) },
+        ];
+        const queueLines = queueGroups.map(({ label, values }) => {
+          const entries = values.length
+            ? values.map((task, index) => {
+              const fileLabel = task.fileNames === null
+                ? "Checking file names..."
+                : task.fileNames.length > 0
+                  ? task.fileNames.join(", ")
+                  : "File names unavailable";
+              const sizeLabel = task.sizeBytes && task.sizeBytes > 0
+                ? task.sizeIsEstimated === false
+                  ? formatBytes(task.sizeBytes)
+                  : `~${formatBytes(task.sizeBytes)} estimated`
+                : "Size unavailable";
+              return `${index + 1}. ${fileLabel} (${sizeLabel})`;
+            }).join("\n")
+            : "Empty";
+          return `${label} (${values.length} waiting):\n${entries}`;
+        });
+        const activeTaskName = activeTask?.fileNames?.length
+          ? activeTask.fileNames.join(", ")
+          : null;
+        const activeTaskSize = activeTask?.sizeBytes && activeTask.sizeBytes > 0
+          ? activeTask.sizeIsEstimated === false
+            ? formatBytes(activeTask.sizeBytes)
+            : `~${formatBytes(activeTask.sizeBytes)} estimated`
+          : null;
+        const activeLine = activeTaskName
+          ? `🔄 *Now processing:* ${activeTaskName}${activeTaskSize ? ` (${activeTaskSize})` : ""}\n`
+          : activeJob
+            ? `🔄 *Now processing:* ${activeJob.files.length > 0
+              ? activeJob.files.map((file) => file.filename).join(", ")
+              : "Checking file names..."}\n`
           : "🔄 *Now processing:* Nothing\n";
-        const waitingLines = queueLines.length
-          ? `\n⏳ *Waiting links:*\n${queueLines.join("\n")}`
-          : "\n✅ No links are waiting.";
+        const waitingLines = `\n⏳ *Queues:*\n${queueLines.join("\n\n")}`;
 
         await telegramService.sendMessage(
           chatId,
           `📋 *Download Queue*\n\n` +
             activeLine +
-            `⏱️ *Waiting:* ${downloadQueue.length}` +
             waitingLines
         );
         continue;
       }
 
-      if (text === "/retries") {
-        const retryLines = retryQueue.length
-          ? retryQueue.map((item, index) => `${index + 1}. ${getRetryLabel(item)}`)
-          : ["✅ No links are currently queued for retry."];
-
-        await telegramService.sendMessage(
-          chatId,
-          `🔁 *Retry Queue*\n\n` +
-            `📊 *Queued retries:* ${retryQueue.length}\n\n` +
-            retryLines.join("\n")
-        );
-        continue;
-      }
-
-      if (text === "/space" || text === "/disk") {
+      if (command === "/space" || command === "/disk") {
         const filesystem = fs.statfsSync(DATA_DIR);
         const blockSize = Number(filesystem.bsize);
         const totalBytes = Number(filesystem.blocks) * blockSize;
@@ -464,7 +646,7 @@ async function pollTelegramUpdates() {
             `⬇️ *Temporary downloads:* ${formatBytes(temporaryDownloadsBytes)}\n` +
             `🗜️ *Unpacked files:* ${formatBytes(unpackedFilesBytes)}\n` +
             `🧹 *Cleanup:* after every job and on startup\n` +
-            `⏳ *Queue:* ${isDownloadInProgress ? "1 active" : "No active job"}, ${downloadQueue.length} waiting\n\n` +
+            `⏳ *Queue:* ${isDownloadInProgress ? "1 active" : "No active job"}, ${getDownloadQueueLength()} waiting (Q1 ${q1DownloadQueue.length} / Q2 ${q2DownloadQueue.length} / Q3 ${q3DownloadQueue.length} / Q4 ${q4DownloadQueue.length})\n\n` +
             `🖥️ *Container filesystem reference*\n` +
             `• *Used:* ${formatBytes(usedBytes)} (${usedPercent}%)\n` +
             `• *Free:* ${formatBytes(freeBytes)}\n` +
@@ -475,17 +657,44 @@ async function pollTelegramUpdates() {
       }
 
       if (isTeraboxUrl(text) || isDiskwalaUrl(text)) {
-        const url = extractUrlFromText(text) || text;
-        enqueueDownloadJob(url, chatId).catch((err) => {
-          console.error("Job execution error from telegram message:", err);
-        });
-      } else {
+        const adjustedText = extractUrlFromText(text);
+        const taskUrl = adjustedText || text;
+        const queuePosition = getDownloadQueueLength() + (isDownloadInProgress ? 1 : 0);
+        const queueLimit = MAX_QUEUE_SIZE;
+
+        if (queuePosition >= queueLimit) {
+          await telegramService.sendMessage(
+            chatId,
+            `⚠️ *Queue is full.* Please try again in a few minutes.`
+          );
+          continue;
+        }
+
+        enqueueDownloadJob(taskUrl, chatId)
+          .then((job) => {
+            console.log("job enqueued", job);
+          })
+          .catch((error) => {
+            console.error("queueing failed", error);
+          });
+        continue;
+      }
+
+      if (command === "/start") {
         await telegramService.sendMessage(
           chatId,
-          `⚠️ Please send a valid TeraBox or Diskwala share link.`
+          `🤖 Bot is running. Send a TeraBox link to download.`
+        );
+      }
+
+      if (command === "/cancel") {
+        await telegramService.sendMessage(
+          chatId,
+          `🚫 Cancel is not supported in this queue.`
         );
       }
     }
+
   } catch (err) {
     console.warn("Polling error:", err);
   }
@@ -495,9 +704,10 @@ async function pollTelegramUpdates() {
   }
 }
 
-function startPolling() {
+async function startPolling() {
   if (isPolling) return;
   isPolling = true;
+  await discardPendingTelegramUpdates();
   pollTelegramUpdates();
   console.log("▶️ Telegram Polling started");
 }
@@ -521,6 +731,7 @@ function createProgressBar(percent: number, length: number = 10): string {
 
 // Core execution engine
 async function processDownloadJob(
+  queueTask: DownloadQueueTask,
   url: string,
   chatId?: number | string,
   retryCount = 0
@@ -529,9 +740,11 @@ async function processDownloadJob(
   const jobDir = path.join(DOWNLOADS_DIR, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
 
+  const linkCounter = getLinkCounterForUrl(url);
   const job: DownloadJob = {
     id: jobId,
     url,
+    linkCounter,
     status: "resolving",
     progress: 10,
     statusText: "Analyzing TeraBox share link...",
@@ -540,21 +753,31 @@ async function processDownloadJob(
     retryCount,
     maxRetries: MAX_RETRY_ATTEMPTS,
     createdAt: Date.now(),
-    logs: [`[${new Date().toLocaleTimeString()}] Job initialized for ${url}`],
+    logs: [`[${new Date().toLocaleTimeString()}] Job initialized for ${url} (link ${formatLinkCounter(url)})`],
   };
 
   jobs.unshift(job);
+  activeCancellationTasks.set(jobId, queueTask);
   if (jobs.length > 50) jobs.pop();
   saveJobs();
 
   let tgStatusMsgId: number | null = null;
+  const cancelReplyMarkup = {
+    inline_keyboard: [[
+      { text: "Cancel download", callback_data: `cancel:${jobId}` },
+    ]],
+  };
   if (chatId && telegramService) {
     try {
+      const counterLabel = formatLinkCounter(url);
       const sent = await telegramService.sendMessage(
         chatId,
         `⏳ *TeraBox Downloader*\n\n` +
+          `🔗 *Link:* ${counterLabel}\n` +
           `\`${createProgressBar(10)}\` 10%\n` +
-          `• *Status:* Getting everything ready...`
+          `• *Status:* Getting everything ready...`,
+        "Markdown",
+        cancelReplyMarkup
       );
       tgStatusMsgId = sent.message_id;
     } catch {
@@ -564,6 +787,29 @@ async function processDownloadJob(
 
   let lastTgUpdateTime = 0;
   let lastTgProgress = -1;
+
+  const removeTelegramStatusMessage = async () => {
+    if (chatId && telegramService && tgStatusMsgId) {
+      const messageId = tgStatusMsgId;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        if (await telegramService.deleteMessage(chatId, messageId)) {
+          tgStatusMsgId = null;
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+
+      await telegramService.editMessageText(
+        chatId,
+        messageId,
+        "✅ Completed",
+        "Markdown",
+        { inline_keyboard: [] }
+      );
+      console.warn(`Could not delete Telegram processing message ${messageId}; removed its cancel button instead.`);
+      tgStatusMsgId = null;
+    }
+  };
 
   const updateStatus = async (
     status: DownloadJob["status"],
@@ -593,12 +839,16 @@ async function processDownloadJob(
           ? `[${bar}] *${roundedProgress}%* (${sizeLabel})`
           : `[${bar}] *${roundedProgress}%*`;
         try {
+          const counterLabel = formatLinkCounter(url);
           await telegramService.editMessageText(
             chatId,
             tgStatusMsgId,
             `⏳ *TeraBox Processing*\n\n` +
+              `🔗 *Link:* ${counterLabel}\n\n` +
               `${barLine}\n\n` +
-                `• *Progress:* ${text}`
+                  `• *Progress:* ${text}`,
+              "Markdown",
+              cancelReplyMarkup
           );
         } catch {
           // ignore edit conflicts
@@ -624,15 +874,22 @@ async function processDownloadJob(
     }
 
     const totalSourceSize = sourceFiles.reduce((sum, file) => sum + (file.sizeBytes || 0), 0);
+    const knownDownloadedSize = getKnownDownloadedSize(url);
+    const processingSizeLabel = knownDownloadedSize
+      ? formatBytes(knownDownloadedSize)
+      : `~${formatBytes(totalSourceSize)} estimated`;
     await updateStatus(
       "downloading",
       45,
       `Downloading ${metadata.title || "your file"}...`,
-      formatBytes(totalSourceSize)
+      processingSizeLabel
     );
 
     const failedFiles: string[] = [];
     for (let fileIndex = 0; fileIndex < sourceFiles.length; fileIndex++) {
+      if (queueTask.cancelRequested) {
+        throw new Error("Download cancelled by user");
+      }
       const sourceFile = sourceFiles[fileIndex];
       const displayName = cleanFilename(sourceFile.filename || `file_${fileIndex + 1}`);
       let downloadedFilePath = "";
@@ -646,7 +903,7 @@ async function processDownloadJob(
           "downloading",
           Math.min(80, 20 + Math.round((fileIndex / sourceFiles.length) * 60)),
           `Downloading ${displayName} (${fileIndex + 1}/${sourceFiles.length})...`,
-          formatBytes(sourceFile.sizeBytes)
+          processingSizeLabel
         );
 
         let candidateName = displayName;
@@ -704,7 +961,7 @@ async function processDownloadJob(
                     "downloading",
                     calculatedProgress,
                     `Downloading ${displayName}... ${percent}%`,
-                    formatBytes(sourceFile.sizeBytes)
+                    processingSizeLabel
                   );
                 },
                 {
@@ -715,6 +972,7 @@ async function processDownloadJob(
                   timestamp: metadata.timestamp || sourceFile.timestamp,
                   fsId: sourceFile.fsId,
                   randsk: metadata.randsk,
+                  beforeChunk: () => yieldActiveLargeJob(queueTask),
                 }
               );
             },
@@ -810,6 +1068,13 @@ async function processDownloadJob(
 
     // Telegram delivery if requested
     if (chatId && telegramService) {
+      const sendTemporaryTelegramNotice = async (text: string) => {
+        const notice = await telegramService!.sendMessage(chatId, text);
+        setTimeout(() => {
+          telegramService?.deleteMessage(chatId, notice.message_id).catch(() => undefined);
+        }, 10000);
+      };
+
       await updateStatus(
         "uploading",
         85,
@@ -824,17 +1089,12 @@ async function processDownloadJob(
 
         try {
           if (isExceedingTelegramLimit) {
-            // Check if MTProto 2GB client is available
+            await sendTemporaryTelegramNotice(`📦 *Large file detected.* Sending...`);
+
             let uploadedViaMTProto = false;
             if (mtprotoService) {
               try {
-                await telegramService.sendMessage(
-                  chatId,
-                  `🚀 *${pf.filename}* (${pf.sizeFormatted}) is large, so I’m sending it in full. This may take a little while...`
-                );
-                
-                // 1. Upload as Video stream (streamable preview in Telegram)
-                const videoCaption = `🎬 *[Video Preview]* \`${pf.filename}\` (${pf.sizeFormatted})`;
+                const videoCaption = `🎬 *[Video Preview]* ${formatLinkCounter(url)} \`${pf.filename}\` (${pf.sizeFormatted})`;
                 await mtprotoService.sendFile(
                   chatId,
                   pf.path,
@@ -842,35 +1102,23 @@ async function processDownloadJob(
                   videoCaption,
                   async (pct) => {
                     const uploadProgress = Math.min(98, 85 + Math.round((pct / 100) * 12));
-                    await updateStatus(
-                      "uploading",
-                      uploadProgress,
-                      `Sending your video... ${pct}%`
-                    );
+                    await updateStatus("uploading", uploadProgress, `Sending your video... ${pct}%`);
                   },
-                  false // forceDocument = false -> Streamable video
+                  false
                 );
-
                 uploadedViaMTProto = true;
               } catch (mtErr: any) {
-                console.warn("MTProto 2GB upload attempt failed, falling back to HTTP split:", mtErr.message);
-                uploadedViaMTProto = false;
+                console.warn("MTProto upload failed, falling back to parts:", mtErr.message);
               }
             }
 
             if (!uploadedViaMTProto) {
-              await telegramService.sendMessage(
-                chatId,
-                `ℹ️ *${pf.filename}* (${pf.sizeFormatted}) is too large for one message.\n✂️ I’ll send it as smaller parts...`
-              );
-
               if (pf.isVideo) {
                 const parts = await splitVideo(pf.path, jobDir, MAX_TELEGRAM_FILE_SIZE);
                 pf.splitPartsCount = parts.length;
                 for (let pIdx = 0; pIdx < parts.length; pIdx++) {
                   const part = parts[pIdx];
-                  // Send streamable video part
-                  const videoPartCaption = `🎬 *[Video Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
+                  const videoPartCaption = `🎬 *[Video Part ${pIdx + 1}/${parts.length}]* ${formatLinkCounter(url)} \`${part.filename}\` (${formatBytes(part.size)})`;
                   await telegramService.sendVideo(chatId, part.path, part.filename, videoPartCaption);
                 }
               } else {
@@ -878,7 +1126,7 @@ async function processDownloadJob(
                 pf.splitPartsCount = parts.length;
                 for (let pIdx = 0; pIdx < parts.length; pIdx++) {
                   const part = parts[pIdx];
-                  const partCaption = `📦 *[Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
+                  const partCaption = `📦 *[Part ${pIdx + 1}/${parts.length}]* ${formatLinkCounter(url)} \`${part.filename}\` (${formatBytes(part.size)})`;
                   await telegramService.sendDocument(chatId, part.path, part.filename, partCaption);
                 }
               }
@@ -886,10 +1134,10 @@ async function processDownloadJob(
           } else {
             // File is <= 50 MB: send videos as streamable Telegram videos.
             if (pf.isVideo) {
-              const videoCaption = `🎬 *[Video Preview]* \`${pf.filename}\` (${pf.sizeFormatted})`;
+              const videoCaption = `🎬 *[Video Preview]* ${formatLinkCounter(url)} \`${pf.filename}\` (${pf.sizeFormatted})`;
               await telegramService.sendVideo(chatId, pf.path, pf.filename, videoCaption);
             } else {
-              const caption = `📄 *[${i + 1}/${processedFiles.length}]* \`${pf.filename}\` (${pf.sizeFormatted})`;
+              const caption = `📄 *[${i + 1}/${processedFiles.length}]* ${formatLinkCounter(url)} \`${pf.filename}\` (${pf.sizeFormatted})`;
               await telegramService.sendDocument(chatId, pf.path, pf.filename, caption);
             }
           }
@@ -903,17 +1151,14 @@ async function processDownloadJob(
             uploadErr.message?.includes("too big")
           ) {
             try {
-              await telegramService.sendMessage(
-                chatId,
-                `✂️ That file is too large for one message. Splitting it into smaller parts...`
-              );
+              await sendTemporaryTelegramNotice(`📦 *Large file detected.* Sending it in parts...`);
               const parts = pf.isVideo
                 ? await splitVideo(pf.path, jobDir, 45 * 1024 * 1024)
                 : await splitBinaryFile(pf.path, jobDir, 45 * 1024 * 1024);
               pf.splitPartsCount = parts.length;
               for (let pIdx = 0; pIdx < parts.length; pIdx++) {
                 const part = parts[pIdx];
-                const partCaption = `📁 *[Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
+                const partCaption = `📁 *[Part ${pIdx + 1}/${parts.length}]* ${formatLinkCounter(url)} \`${part.filename}\` (${formatBytes(part.size)})`;
                 if (part.isVideo) {
                   await telegramService.sendVideo(chatId, part.path, part.filename, partCaption);
                 } else {
@@ -935,13 +1180,7 @@ async function processDownloadJob(
         }
       }
 
-      if (tgStatusMsgId) {
-        try {
-          await telegramService.deleteMessage(chatId, tgStatusMsgId);
-        } catch {
-          // ignore
-        }
-      }
+      await removeTelegramStatusMessage();
 
     }
 
@@ -953,8 +1192,21 @@ async function processDownloadJob(
     saveJobs();
   } catch (err: any) {
     console.error("Job processing failed:", err);
+    if (err?.message === "Download cancelled by user") {
+      job.status = "failed";
+      job.error = "Cancelled by user";
+      job.statusText = "Cancelled by user";
+      saveJobs();
+      if (chatId && telegramService) {
+        await removeTelegramStatusMessage();
+        await telegramService.sendMessage(chatId, `🛑 *Download cancelled.*\n\n🔗 ${url}`);
+      }
+      cleanupJobFiles(jobId);
+      activeCancellationTasks.delete(jobId);
+      return job;
+    }
     const nextRetryCount = (job.retryCount ?? 0) + 1;
-    const canRetry = shouldRetryLink(job.retryCount ?? 0, MAX_RETRY_ATTEMPTS);
+    const canRetry = shouldRetryLink(nextRetryCount, MAX_RETRY_ATTEMPTS);
 
     if (canRetry) {
       job.retryCount = nextRetryCount;
@@ -967,6 +1219,7 @@ async function processDownloadJob(
       queueRetryJob(url, chatId, retryFileNames, nextRetryCount);
 
       if (chatId && telegramService) {
+        await removeTelegramStatusMessage();
         const label = getRetryLabel({
           fileNames: retryFileNames,
           url,
@@ -990,16 +1243,18 @@ async function processDownloadJob(
     saveJobs();
 
     if (chatId && telegramService) {
+      await removeTelegramStatusMessage();
       await telegramService.sendMessage(
         chatId,
-        `❌ *Download Failed*\n\n` +
-          `I couldn’t download that link after ${MAX_RETRY_ATTEMPTS} attempts. It may be expired, private, or protected.\n\n` +
-          `💡 *Tip:* Make sure the link is public and try again.`
+        `❌ *Unable to download this link*\n\n` +
+          `🔗 ${url}\n\n` +
+          `I couldn’t download it after ${MAX_RETRY_ATTEMPTS} attempts. It may be expired, private, or protected.`
       );
     }
   }
 
   cleanupJobFiles(jobId);
+  activeCancellationTasks.delete(jobId);
 
   return job;
 }

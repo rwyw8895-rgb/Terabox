@@ -14,6 +14,7 @@ export interface ProcessedFile {
 export interface DownloadJob {
   id: string;
   url: string;
+  linkCounter?: number;
   status: 'pending' | 'resolving' | 'downloading' | 'unpacking' | 'uploading' | 'completed' | 'failed';
   progress: number;
   statusText: string;
