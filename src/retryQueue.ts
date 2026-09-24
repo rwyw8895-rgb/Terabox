@@ -22,6 +22,6 @@ export function getRetryLabel(item: RetryQueueItemInput): string {
   return `${getRetryDisplayName(item.fileNames, item.url)} (retry ${item.retryCount}/${item.maxRetries})`;
 }
 
-export function shouldRetryLink(retryCount: number, maxRetries: number): boolean {
-  return retryCount < maxRetries;
+export function shouldRetryLink(_retryCount: number, _maxRetries: number): boolean {
+  return false;
 }

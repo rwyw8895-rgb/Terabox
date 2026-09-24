@@ -26,13 +26,11 @@ import { TelegramService, TelegramBotInfo } from "./server/telegram.ts";
 import { MTProtoService } from "./server/mtproto.ts";
 import type { DownloadJob, ProcessedFile, BotStatus } from "./src/types.ts";
 import { formatLinkCounter, getLinkCounterForUrl, normalizeLink } from "./src/linkCounter.ts";
-import { classifyQueueTier, shouldPauseLargeJobForSmallerQueue } from "./src/queuePriority.ts";
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE) || 100;
-const MAX_RETRY_ATTEMPTS = 5;
+const MAX_RETRY_ATTEMPTS = 1;
 const RETRY_DELAY_MS = 1500;
-const DOWNLOAD_STATUS_REFRESH_MS = 1000;
 const MAX_FILES_PER_LINK = 25;
 const MAX_SOURCE_FILE_SIZE_BYTES = 512 * 1024 * 1024;
 const MAX_ZIP_SIZE_BYTES = 250 * 1024 * 1024;
@@ -88,7 +86,8 @@ app.use((req, res, next) => {
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
 const DOWNLOADS_DIR = path.join(DATA_DIR, "downloads");
 const UNPACKED_DIR = path.join(DATA_DIR, "unpacked");
-const POLLING_OFFSET_FILE = path.join(DATA_DIR, "telegram-offset.json");
+const pollingBotKey = (process.env.TELEGRAM_BOT_TOKEN || "default").split(":", 1)[0];
+const POLLING_OFFSET_FILE = path.join(DATA_DIR, `telegram-offset-${pollingBotKey}.json`);
 fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 fs.mkdirSync(UNPACKED_DIR, { recursive: true });
 
@@ -219,7 +218,7 @@ type DownloadQueueTask = {
   sizeIsEstimated?: boolean;
   cancelRequested?: boolean;
   retryCount?: number;
-  isLarge?: boolean;
+  queuedAt: number;
   resolve: (job: DownloadJob) => void;
   reject: (error: unknown) => void;
 };
@@ -232,84 +231,30 @@ type RetryQueueItem = {
   maxRetries: number;
 };
 
-const LARGE_FILE_SIZE_THRESHOLD_BYTES = 200 * 1024 * 1024;
-const q1DownloadQueue: DownloadQueueTask[] = [];
-const q2DownloadQueue: DownloadQueueTask[] = [];
-const q3DownloadQueue: DownloadQueueTask[] = [];
-const q4DownloadQueue: DownloadQueueTask[] = [];
+const sizeInspectionQueue: DownloadQueueTask[] = [];
+const downloadQueue: DownloadQueueTask[] = [];
 const retryQueue: RetryQueueItem[] = [];
+let isSizeInspectionInProgress = false;
 let isDownloadInProgress = false;
-let activeQueueTier: "q1" | "q2" | "q3" | "q4" | null = null;
 let activeTask: DownloadQueueTask | null = null;
 const activeCancellationTasks = new Map<string, DownloadQueueTask>();
-let pausedActiveJob: {
-  task: DownloadQueueTask;
-  tier: "q1" | "q2" | "q3" | "q4";
-  resume: () => void;
-} | null = null;
-
-function getQueueCounts(): { q1: number; q2: number; q3: number; q4: number } {
-  return {
-    q1: q1DownloadQueue.length,
-    q2: q2DownloadQueue.length,
-    q3: q3DownloadQueue.length,
-    q4: q4DownloadQueue.length,
-  };
-}
 
 function getDownloadQueueLength(): number {
-  return q1DownloadQueue.length + q2DownloadQueue.length + q3DownloadQueue.length + q4DownloadQueue.length;
+  return downloadQueue.length;
+}
+
+function getTotalQueueLength(): number {
+  return sizeInspectionQueue.length + downloadQueue.length;
 }
 
 function compareQueueTasks(left: DownloadQueueTask, right: DownloadQueueTask): number {
-  return (left.sizeBytes ?? Number.MAX_SAFE_INTEGER) - (right.sizeBytes ?? Number.MAX_SAFE_INTEGER);
+  return (left.sizeBytes ?? Number.MAX_SAFE_INTEGER) - (right.sizeBytes ?? Number.MAX_SAFE_INTEGER) ||
+    left.queuedAt - right.queuedAt;
 }
 
 function getNextQueuedTask(): DownloadQueueTask | undefined {
-  const queues = [q1DownloadQueue, q2DownloadQueue, q3DownloadQueue, q4DownloadQueue];
-  for (const queue of queues) {
-    queue.sort(compareQueueTasks);
-    if (queue.length > 0) return queue.shift();
-  }
-  return undefined;
-}
-
-function pushTaskToCorrectQueue(task: DownloadQueueTask): void {
-  const queueTier = classifyQueueTier(task.sizeBytes ?? 0);
-  const queueMap = {
-    q1: q1DownloadQueue,
-    q2: q2DownloadQueue,
-    q3: q3DownloadQueue,
-    q4: q4DownloadQueue,
-  };
-  queueMap[queueTier].push(task);
-}
-
-function shouldPauseActiveLargeJob(): boolean {
-  if (!activeQueueTier || activeQueueTier === 'q1' || activeQueueTier === 'q2' || activeQueueTier === 'q3') {
-    return false;
-  }
-  return shouldPauseLargeJobForSmallerQueue(activeQueueTier, getQueueCounts());
-}
-
-function hasHigherPriorityQueuedTask(): boolean {
-  return q1DownloadQueue.length > 0 || q2DownloadQueue.length > 0 || q3DownloadQueue.length > 0;
-}
-
-async function yieldActiveLargeJob(task: DownloadQueueTask): Promise<void> {
-  if (task.cancelRequested) {
-    throw new Error("Download cancelled by user");
-  }
-  if (activeTask !== task || !shouldPauseActiveLargeJob() || !activeQueueTier) return;
-
-  const tier = activeQueueTier;
-  await new Promise<void>((resume) => {
-    pausedActiveJob = { task, tier, resume };
-    activeTask = null;
-    activeQueueTier = null;
-    isDownloadInProgress = false;
-    processDownloadQueue();
-  });
+  downloadQueue.sort(compareQueueTasks);
+  return downloadQueue.shift();
 }
 
 function getRetryDisplayName(fileNames: string[] | null, url: string): string {
@@ -330,20 +275,14 @@ function getRetryLabel(item: Pick<RetryQueueItem, "fileNames" | "url" | "retryCo
 }
 
 function shouldRetryLink(retryCount: number, maxRetries: number): boolean {
-  return retryCount < maxRetries;
+  return false;
 }
 
 function queueRetryJob(url: string, chatId?: number | string, fileNames: string[] | null = null, retryCount = 1): void {
-  const nextRetryCount = retryCount;
-  const item: RetryQueueItem = {
-    url,
-    chatId,
-    fileNames,
-    retryCount: nextRetryCount,
-    maxRetries: MAX_RETRY_ATTEMPTS,
-  };
-
-  retryQueue.push(item);
+  void url;
+  void chatId;
+  void fileNames;
+  void retryCount;
 }
 
 function getKnownDownloadedSize(url: string): number | undefined {
@@ -368,44 +307,40 @@ async function resolveQueuedFileNames(task: DownloadQueueTask) {
     const knownDownloadedSize = getKnownDownloadedSize(task.url);
     task.sizeBytes = knownDownloadedSize ?? totalEstimatedBytes;
     task.sizeIsEstimated = knownDownloadedSize === undefined;
-    task.isLarge =
-      task.sizeBytes >= LARGE_FILE_SIZE_THRESHOLD_BYTES ||
-      metadata.files.some((file) => (file.sizeBytes || 0) >= LARGE_FILE_SIZE_THRESHOLD_BYTES);
-
-    const tier = classifyQueueTier(task.sizeBytes || 0);
-    const queueMap = { q1: q1DownloadQueue, q2: q2DownloadQueue, q3: q3DownloadQueue, q4: q4DownloadQueue };
-    const currentQueue = queueMap[tier];
-    if (!currentQueue.includes(task)) currentQueue.push(task);
   } catch {
     task.fileNames = [];
-    task.sizeBytes = 0;
+    task.sizeBytes = undefined;
     task.sizeIsEstimated = false;
-    task.isLarge = false;
-    if (!q1DownloadQueue.includes(task)) q1DownloadQueue.push(task);
   }
+}
+
+function processSizeInspectionQueue(): void {
+  if (isSizeInspectionInProgress) return;
+
+  const task = sizeInspectionQueue.shift();
+  if (!task) return;
+
+  isSizeInspectionInProgress = true;
+  resolveQueuedFileNames(task)
+    .finally(() => {
+      isSizeInspectionInProgress = false;
+      downloadQueue.push(task);
+      processDownloadQueue();
+      processSizeInspectionQueue();
+    });
 }
 
 function processDownloadQueue() {
   if (isDownloadInProgress) return;
 
-  if (pausedActiveJob && !hasHigherPriorityQueuedTask()) {
-    const paused = pausedActiveJob;
-    pausedActiveJob = null;
-    activeTask = paused.task;
-    activeQueueTier = paused.tier;
-    isDownloadInProgress = true;
-    paused.resume();
-    return;
-  }
-
   if (getDownloadQueueLength() === 0 && retryQueue.length > 0) {
     const retryItem = retryQueue.shift()!;
-    pushTaskToCorrectQueue({
+    downloadQueue.push({
       url: retryItem.url,
       chatId: retryItem.chatId,
       fileNames: retryItem.fileNames,
       retryCount: retryItem.retryCount,
-      isLarge: false,
+      queuedAt: Date.now(),
       resolve: () => undefined,
       reject: () => undefined,
     });
@@ -414,7 +349,6 @@ function processDownloadQueue() {
   const task = getNextQueuedTask();
   if (!task) return;
 
-  activeQueueTier = classifyQueueTier(task.sizeBytes ?? 0);
   activeTask = task;
   isDownloadInProgress = true;
 
@@ -428,7 +362,6 @@ function processDownloadQueue() {
     .finally(() => {
       if (activeTask === task) {
         activeTask = null;
-        activeQueueTier = null;
         isDownloadInProgress = false;
         processDownloadQueue();
       }
@@ -436,7 +369,7 @@ function processDownloadQueue() {
 }
 
 function enqueueDownloadJob(url: string, chatId?: number | string): Promise<DownloadJob> {
-  if (getDownloadQueueLength() >= MAX_QUEUE_SIZE) {
+  if (getTotalQueueLength() >= MAX_QUEUE_SIZE) {
     return Promise.reject(new Error("The download queue is full. Please try again in a few minutes."));
   }
 
@@ -445,17 +378,12 @@ function enqueueDownloadJob(url: string, chatId?: number | string): Promise<Down
       url,
       chatId,
       fileNames: null,
-      isLarge: false,
+      queuedAt: Date.now(),
       resolve,
       reject,
     };
-    resolveQueuedFileNames(task)
-      .then(() => {
-        processDownloadQueue();
-      })
-      .catch((error) => {
-        reject(error);
-      });
+    sizeInspectionQueue.push(task);
+    processSizeInspectionQueue();
   });
 }
 
@@ -564,10 +492,8 @@ async function pollTelegramUpdates() {
           chatId,
           `⚡ *Bot Status:* Online\n` +
             `📥 *Active Jobs:* ${activeCount}\n` +
-            `📦 *Q1:* ${q1DownloadQueue.length}\n` +
-            `🟦 *Q2:* ${q2DownloadQueue.length}\n` +
-            `🟧 *Q3:* ${q3DownloadQueue.length}\n` +
-            `🧱 *Q4:* ${q4DownloadQueue.length}\n` +
+            `🔎 *Finding sizes:* ${sizeInspectionQueue.length + (isSizeInspectionInProgress ? 1 : 0)}\n` +
+            `📦 *Ready to download:* ${downloadQueue.length}\n` +
             `🔁 *Retry Queue:* ${retryQueue.length}\n` +
             `📁 *Total Processed:* ${jobs.length}`
         );
@@ -578,30 +504,25 @@ async function pollTelegramUpdates() {
         const activeJob = jobs.find(
           (j) => j.status !== "completed" && j.status !== "failed"
         );
-        const queueGroups = [
-          { label: "Q1", values: [...q1DownloadQueue].sort(compareQueueTasks) },
-          { label: "Q2", values: [...q2DownloadQueue].sort(compareQueueTasks) },
-          { label: "Q3", values: [...q3DownloadQueue].sort(compareQueueTasks) },
-          { label: "Q4", values: [...q4DownloadQueue].sort(compareQueueTasks) },
-        ];
-        const queueLines = queueGroups.map(({ label, values }) => {
-          const entries = values.length
-            ? values.map((task, index) => {
-              const fileLabel = task.fileNames === null
-                ? "Checking file names..."
-                : task.fileNames.length > 0
-                  ? task.fileNames.join(", ")
-                  : "File names unavailable";
-              const sizeLabel = task.sizeBytes && task.sizeBytes > 0
-                ? task.sizeIsEstimated === false
-                  ? formatBytes(task.sizeBytes)
-                  : `~${formatBytes(task.sizeBytes)} estimated`
-                : "Size unavailable";
-              return `${index + 1}. ${fileLabel} (${sizeLabel})`;
-            }).join("\n")
-            : "Empty";
-          return `${label} (${values.length} waiting):\n${entries}`;
-        });
+        const inspectionLines = sizeInspectionQueue.length
+          ? sizeInspectionQueue.map((task, index) => `${index + 1}. ${task.url}`).join("\n")
+          : "Empty";
+        const queuedTasks = [...downloadQueue].sort(compareQueueTasks);
+        const queueLines = queuedTasks.length
+          ? queuedTasks.map((task, index) => {
+            const fileLabel = task.fileNames === null
+              ? "Checking file names..."
+              : task.fileNames.length > 0
+                ? task.fileNames.join(", ")
+                : "File names unavailable";
+            const sizeLabel = task.sizeBytes && task.sizeBytes > 0
+              ? task.sizeIsEstimated === false
+                ? formatBytes(task.sizeBytes)
+                : `~${formatBytes(task.sizeBytes)} estimated`
+              : "Size unavailable";
+            return `${index + 1}. ${fileLabel} (${sizeLabel})`;
+          }).join("\n")
+          : "Empty";
         const activeTaskName = activeTask?.fileNames?.length
           ? activeTask.fileNames.join(", ")
           : null;
@@ -617,7 +538,9 @@ async function pollTelegramUpdates() {
               ? activeJob.files.map((file) => file.filename).join(", ")
               : "Checking file names..."}\n`
           : "🔄 *Now processing:* Nothing\n";
-        const waitingLines = `\n⏳ *Queues:*\n${queueLines.join("\n\n")}`;
+        const waitingLines =
+          `\n🔎 *Finding file sizes (${sizeInspectionQueue.length + (isSizeInspectionInProgress ? 1 : 0)}):*\n${inspectionLines}` +
+          `\n\n⏳ *Download queue (${queuedTasks.length} waiting, smallest first):*\n${queueLines}`;
 
         await telegramService.sendMessage(
           chatId,
@@ -646,7 +569,7 @@ async function pollTelegramUpdates() {
             `⬇️ *Temporary downloads:* ${formatBytes(temporaryDownloadsBytes)}\n` +
             `🗜️ *Unpacked files:* ${formatBytes(unpackedFilesBytes)}\n` +
             `🧹 *Cleanup:* after every job and on startup\n` +
-            `⏳ *Queue:* ${isDownloadInProgress ? "1 active" : "No active job"}, ${getDownloadQueueLength()} waiting (Q1 ${q1DownloadQueue.length} / Q2 ${q2DownloadQueue.length} / Q3 ${q3DownloadQueue.length} / Q4 ${q4DownloadQueue.length})\n\n` +
+            `⏳ *Queue:* ${isDownloadInProgress ? "1 active" : "No active job"}, ${getTotalQueueLength()} waiting (${sizeInspectionQueue.length} finding sizes, ${downloadQueue.length} ready)\n\n` +
             `🖥️ *Container filesystem reference*\n` +
             `• *Used:* ${formatBytes(usedBytes)} (${usedPercent}%)\n` +
             `• *Free:* ${formatBytes(freeBytes)}\n` +
@@ -659,7 +582,7 @@ async function pollTelegramUpdates() {
       if (isTeraboxUrl(text) || isDiskwalaUrl(text)) {
         const adjustedText = extractUrlFromText(text);
         const taskUrl = adjustedText || text;
-        const queuePosition = getDownloadQueueLength() + (isDownloadInProgress ? 1 : 0);
+        const queuePosition = getTotalQueueLength() + (isDownloadInProgress ? 1 : 0);
         const queueLimit = MAX_QUEUE_SIZE;
 
         if (queuePosition >= queueLimit) {
@@ -678,13 +601,6 @@ async function pollTelegramUpdates() {
             console.error("queueing failed", error);
           });
         continue;
-      }
-
-      if (command === "/start") {
-        await telegramService.sendMessage(
-          chatId,
-          `🤖 Bot is running. Send a TeraBox link to download.`
-        );
       }
 
       if (command === "/cancel") {
@@ -721,14 +637,6 @@ function stopPolling() {
   console.log("⏹️ Telegram Polling stopped");
 }
 
-// Visual progress bar generator for Telegram messages
-function createProgressBar(percent: number, length: number = 10): string {
-  const bounded = Math.max(0, Math.min(100, Math.round(percent)));
-  const filledCount = Math.round((bounded / 100) * length);
-  const emptyCount = length - filledCount;
-  return "■".repeat(filledCount) + "□".repeat(emptyCount);
-}
-
 // Core execution engine
 async function processDownloadJob(
   queueTask: DownloadQueueTask,
@@ -761,100 +669,17 @@ async function processDownloadJob(
   if (jobs.length > 50) jobs.pop();
   saveJobs();
 
-  let tgStatusMsgId: number | null = null;
-  const cancelReplyMarkup = {
-    inline_keyboard: [[
-      { text: "Cancel download", callback_data: `cancel:${jobId}` },
-    ]],
-  };
-  if (chatId && telegramService) {
-    try {
-      const counterLabel = formatLinkCounter(url);
-      const sent = await telegramService.sendMessage(
-        chatId,
-        `⏳ *TeraBox Downloader*\n\n` +
-          `🔗 *Link:* ${counterLabel}\n` +
-          `\`${createProgressBar(10)}\` 10%\n` +
-          `• *Status:* Getting everything ready...`,
-        "Markdown",
-        cancelReplyMarkup
-      );
-      tgStatusMsgId = sent.message_id;
-    } catch {
-      // ignore
-    }
-  }
-
-  let lastTgUpdateTime = 0;
-  let lastTgProgress = -1;
-
-  const removeTelegramStatusMessage = async () => {
-    if (chatId && telegramService && tgStatusMsgId) {
-      const messageId = tgStatusMsgId;
-      for (let attempt = 0; attempt < 5; attempt++) {
-        if (await telegramService.deleteMessage(chatId, messageId)) {
-          tgStatusMsgId = null;
-          return;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-
-      await telegramService.editMessageText(
-        chatId,
-        messageId,
-        "✅ Completed",
-        "Markdown",
-        { inline_keyboard: [] }
-      );
-      console.warn(`Could not delete Telegram processing message ${messageId}; removed its cancel button instead.`);
-      tgStatusMsgId = null;
-    }
-  };
-
   const updateStatus = async (
     status: DownloadJob["status"],
     progress: number,
     text: string,
-    sizeLabel?: string,
-    forceTelegramUpdate: boolean = false
+    _sizeLabel?: string,
+    _forceTelegramUpdate: boolean = false
   ) => {
     job.status = status;
     job.progress = progress;
     job.statusText = text;
     job.logs.push(`[${new Date().toLocaleTimeString()}] ${text}`);
-
-    if (chatId && telegramService && tgStatusMsgId) {
-      const now = Date.now();
-      const roundedProgress = Math.round(progress);
-      // Throttle telegram message edits to max once every 1.5 seconds or on major milestone to prevent Telegram 429 rate limit
-      if (
-        forceTelegramUpdate ||
-        (now - lastTgUpdateTime > DOWNLOAD_STATUS_REFRESH_MS && Math.abs(roundedProgress - lastTgProgress) >= 5) ||
-        roundedProgress === 100
-      ) {
-        lastTgUpdateTime = now;
-        lastTgProgress = roundedProgress;
-        const bar = createProgressBar(roundedProgress, 12);
-        const barLine = sizeLabel
-          ? `[${bar}] *${roundedProgress}%* (${sizeLabel})`
-          : `[${bar}] *${roundedProgress}%*`;
-        try {
-          const counterLabel = formatLinkCounter(url);
-          await telegramService.editMessageText(
-            chatId,
-            tgStatusMsgId,
-            `⏳ *TeraBox Processing*\n\n` +
-              `🔗 *Link:* ${counterLabel}\n\n` +
-              `${barLine}\n\n` +
-                  `• *Progress:* ${text}`,
-              "Markdown",
-              cancelReplyMarkup
-          );
-        } catch {
-          // ignore edit conflicts
-        }
-      }
-    }
   };
 
   try {
@@ -972,7 +797,6 @@ async function processDownloadJob(
                   timestamp: metadata.timestamp || sourceFile.timestamp,
                   fsId: sourceFile.fsId,
                   randsk: metadata.randsk,
-                  beforeChunk: () => yieldActiveLargeJob(queueTask),
                 }
               );
             },
@@ -1180,8 +1004,6 @@ async function processDownloadJob(
         }
       }
 
-      await removeTelegramStatusMessage();
-
     }
 
     job.status = "completed";
@@ -1198,44 +1020,12 @@ async function processDownloadJob(
       job.statusText = "Cancelled by user";
       saveJobs();
       if (chatId && telegramService) {
-        await removeTelegramStatusMessage();
         await telegramService.sendMessage(chatId, `🛑 *Download cancelled.*\n\n🔗 ${url}`);
       }
       cleanupJobFiles(jobId);
       activeCancellationTasks.delete(jobId);
       return job;
     }
-    const nextRetryCount = (job.retryCount ?? 0) + 1;
-    const canRetry = shouldRetryLink(nextRetryCount, MAX_RETRY_ATTEMPTS);
-
-    if (canRetry) {
-      job.retryCount = nextRetryCount;
-      job.status = "pending";
-      job.statusText = `Retrying download (${nextRetryCount}/${MAX_RETRY_ATTEMPTS})...`;
-      job.logs.push(`[${new Date().toLocaleTimeString()}] Retrying link (attempt ${nextRetryCount}/${MAX_RETRY_ATTEMPTS})`);
-      saveJobs();
-
-      const retryFileNames = job.files.length > 0 ? job.files.map((file) => file.filename) : null;
-      queueRetryJob(url, chatId, retryFileNames, nextRetryCount);
-
-      if (chatId && telegramService) {
-        await removeTelegramStatusMessage();
-        const label = getRetryLabel({
-          fileNames: retryFileNames,
-          url,
-          retryCount: nextRetryCount,
-          maxRetries: MAX_RETRY_ATTEMPTS,
-        });
-        await telegramService.sendMessage(
-          chatId,
-          `🔁 *Retrying download*\n\n` +
-            `• ${label}`
-        );
-      }
-
-      return job;
-    }
-
     job.status = "failed";
     job.error = err.message || "Unknown download error";
     job.statusText = `Failed: ${job.error}`;
@@ -1243,12 +1033,10 @@ async function processDownloadJob(
     saveJobs();
 
     if (chatId && telegramService) {
-      await removeTelegramStatusMessage();
       await telegramService.sendMessage(
         chatId,
         `❌ *Unable to download this link*\n\n` +
-          `🔗 ${url}\n\n` +
-          `I couldn’t download it after ${MAX_RETRY_ATTEMPTS} attempts. It may be expired, private, or protected.`
+          `🔗 ${url}`
       );
     }
   }
