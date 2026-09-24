@@ -672,6 +672,7 @@ export async function downloadM3u8Stream(
     timestamp?: string;
     fsId?: string;
     randsk?: string;
+    beforeChunk?: () => Promise<void>;
   }
 ): Promise<void> {
   const headers: Record<string, string> = {
@@ -757,6 +758,9 @@ export async function downloadM3u8Stream(
 
     for (let t = stepSeconds; t <= maxScanTime; t += stepSeconds) {
       try {
+        if (metadata?.beforeChunk) {
+          await metadata.beforeChunk();
+        }
         const timeStreamUrl = `https://www.terabox.app/share/streaming?app_id=250528&web=1&channel=dubox&clienttype=0&shareid=${shareid}&uk=${uk}&fid=${fid}&sign=${encodeURIComponent(
           sign
         )}&timestamp=${timestamp}&type=M3U8_AUTO_480&time=${t}&esl=1&isplayer=1&ehps=1`;
@@ -795,6 +799,9 @@ export async function downloadM3u8Stream(
 
   try {
     for (let i = 0; i < sortedChunkIndices.length; i++) {
+      if (metadata?.beforeChunk) {
+        await metadata.beforeChunk();
+      }
       const idx = sortedChunkIndices[i];
       const chunk = discoveredChunks.get(idx)!;
 
